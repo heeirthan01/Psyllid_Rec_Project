@@ -1,0 +1,280 @@
+#include <psyllid-snipsfft128_inferencing.h>
+#include <SPI.h>
+#include <SD.h>
+
+
+//SPI.setSCK(8);  // Set the SCK pin
+//SPI.setTX(9);  // Set the MOSI pin
+//SPI.setRX(6);  // Set the MISO pin
+//SPI.begin();
+//SPI.setCS(7);
+const int maxSamples = 16000; // Adjust the size based on your requirements
+static float features[maxSamples]; // Raw features here
+int malecnt = 0;
+int femalecnt = 0;
+int malefmf = 0;
+int femalemaf = 0;
+size_t startSampleIndex = 0;  // Index of the first sample in the current segment
+
+
+//int confusionMatrix[4][4];
+char trueClass;
+const char* classLabels[] = {"male", "female"};
+
+
+void print_inference_result(ei_impulse_result_t result);
+int raw_feature_get_data(size_t offset, size_t length, float *out_ptr);
+void processWavFile(const char *fileName);
+void performInference(float features, size_t length);
+
+
+void setup()
+{
+    Serial.begin(115200);
+    while (!Serial);
+    pinMode(10, OUTPUT); // Ensure SS pin is set to output
+    SPI.begin();         // Initialize SPI
+    Serial.print("Initializing SD card...");
+    if (!SD.begin(10))
+    {
+        Serial.println("Initialization failed!");
+        while (1);
+    }
+    Serial.println("Initialization done.");
+
+
+    Serial.println("Edge Impulse Inferencing Demo");
+
+
+    Serial.println("Edge Impulse standalone inferencing (Arduino)");
+
+
+    File root = SD.open("/");
+    if (!root)
+    {
+        Serial.println("Error opening root directory");
+        while (1);
+    }
+
+
+    // Processing each of the file in the root directory of SD card
+    while (true)
+    {
+        File entry = root.openNextFile();
+
+
+        if (!entry)
+        {
+            // no more files
+            Serial.println("No more files");
+            break;
+        }
+
+
+        String fileName = entry.name();
+        Serial.println(fileName);
+        if (fileName.endsWith(".WAV"))
+        {
+            Serial.print("Processing file: ");
+            Serial.println(fileName);
+
+
+            
+
+
+            // Extract the first character from the filename
+            trueClass = fileName[0];
+
+
+            // Check if it's an alphabetic character and convert to lowercase
+            if (isalpha(trueClass)) {
+                trueClass = tolower(trueClass);
+            }
+
+
+            //Serial.println("True Class: " + String(trueClass));  
+
+
+            // Process the WAV file
+            processWavFile(fileName.c_str());
+
+
+            // Delay before processing the next file 
+            //delay(5000);
+        }
+        else{
+          Serial.println(fileName);
+          Serial.println("was skipped");
+        }
+        entry.close();
+    }
+    
+   // processWavFile("yessound.wav");
+   // processWavFile("nosound.wav");
+    root.close();
+
+
+    // If I want to implement confusion matrix
+    int confusionMatrix[2][2] = { {malecnt,malefmf},
+                        {femalemaf,femalecnt},
+    };
+    
+   
+    
+}
+
+
+void loop()
+{
+    
+}
+
+
+int raw_feature_get_data(size_t offset, size_t length, float *out_ptr)
+{
+    memcpy(out_ptr, features + offset, length * sizeof(float));
+    return 0;
+}
+
+
+void processWavFile(const char *fileName) {
+    Serial.print("Processing WAV file: ");
+    Serial.println(fileName);
+
+
+    File myFile = SD.open(fileName);
+    if (!myFile) {
+        Serial.println("Failed to open WAV file.");
+        return;  // Exit the function if the file cannot be opened
+    }
+
+
+    Serial.println("WAV file opened successfully");
+
+
+    // Read WAV header to extract sample rate, assuming a 44-byte header
+    char header[44];
+    myFile.read(header, sizeof(header));
+    unsigned int sampleRate = header[24] | (header[25] << 8) | (header[26] << 16) | (header[27] << 24);
+    Serial.print("Sample Rate: ");
+    Serial.println(sampleRate);
+
+
+    float segmentLengthSecs = 0.2;  // Each segment 0.2 seconds
+    float stepSecs = 0.1;  // goes from 0 to 0.2, then to 0.1 to 0.3 and so on.
+    size_t samplesPerSegment = (size_t)(sampleRate * segmentLengthSecs);
+    size_t stepSamples = (size_t)(sampleRate * stepSecs);
+
+
+    
+    size_t totalSamples = 57 * sampleRate;  // Total amount of samples for a 57-second file
+
+
+    while (startSampleIndex + samplesPerSegment <= totalSamples) {
+        memset(features, 0, sizeof(features));  // Clear the features buffer
+
+
+        myFile.seek(44 + startSampleIndex * sizeof(int16_t));  // Adjust for WAV header
+
+
+        // Load samples for the current segment into the features buffer
+        for (size_t i = 0; i < samplesPerSegment && myFile.available(); ++i) {
+            int16_t sample;
+            if (myFile.read((uint8_t*)&sample, sizeof(sample)) == sizeof(sample)) {
+                features[i] = static_cast<float>(sample);
+            }
+        }
+
+
+        Serial.print("Processing at sample number: ");
+        Serial.println(startSampleIndex);
+
+
+        // Perform inference on the current segment
+        ei_impulse_result_t result;
+        signal_t signal;
+        signal.total_length = samplesPerSegment;
+        signal.get_data = &raw_feature_get_data;
+        EI_IMPULSE_ERROR res = run_classifier(&signal, &result, false);
+        if (res == EI_IMPULSE_OK) {
+            print_inference_result(result);
+        } else {
+            Serial.print("Inference failed: ");
+            Serial.println(res);
+        }
+
+
+        // Moving to next segment
+        startSampleIndex += stepSamples;
+    }
+
+
+    myFile.close();  // Close the file
+    Serial.println("Finished processing WAV file");
+}
+
+
+
+
+
+
+void print_inference_result(ei_impulse_result_t result)
+{
+    File file = SD.open("IF.txt", FILE_WRITE);
+    if (!file) {
+        Serial.println("Failed to open file for writing.");
+        return;  // Exit if the file cannot be opened or created
+    }
+    Serial.print("Processing at sample number: ");
+    Serial.println(startSampleIndex);  // Use the global variable directly
+    //delay(5000);
+    // Print how long it took to perform inference
+    Serial.print("Timing: DSP ");
+    Serial.print(result.timing.dsp);
+    Serial.print(" ms, inference ");
+    Serial.print(result.timing.classification);
+    Serial.print(" ms, anomaly ");
+    Serial.print(result.timing.anomaly);
+    Serial.println(" ms");
+
+
+    // Print the prediction results (classification)
+    Serial.println("Predictions:");
+    for (uint16_t i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++)
+    {
+       
+        Serial.print("  ");
+        Serial.print(ei_classifier_inferencing_categories[i]);
+        Serial.print(": ");
+        Serial.println(result.classification[i].value, 5);
+        if(result.classification[i].value >= 0.5){
+            //This is just for debugging
+            Serial.print("Sample index: ");
+            Serial.print(startSampleIndex);
+            Serial.print(", ");
+            Serial.print(ei_classifier_inferencing_categories[i]);
+            Serial.print(": ");
+            Serial.println(result.classification[i].value, 5);
+
+
+            // This is printing to file
+            file.print("Sample index: ");
+            file.print(startSampleIndex);
+            file.print(", ");
+            file.print(ei_classifier_inferencing_categories[i]);
+            file.print(": ");
+            file.println(result.classification[i].value, 5);
+        }   
+    }
+    file.close();
+    
+    // Print anomaly result (if it exists)
+#if EI_CLASSIFIER_HAS_ANOMALY == 1
+    Serial.print("Anomaly prediction: ");
+    Serial.println(result.anomaly, 3);
+#endif
+
+
+    Serial.println();
+    //delay(5000);
+}
